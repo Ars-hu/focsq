@@ -155,74 +155,81 @@ class LinkParser {
 
   static const String scheme = 'csqtt://';
   static const String _connectPrefix = '${scheme}connect?';
+  static const Set<String> _knownKeys = {
+    'host',
+    'peer',
+    'password',
+    'hashes',
+    'token',
+    'workers',
+    'client',
+  };
 
   final Random _random;
 
   ParsedLinkResult? parseLinkFull(String link) {
     final trimmed = link.trim();
-    if (!trimmed.toLowerCase().startsWith(scheme)) return null;
+    if (!trimmed.startsWith(scheme)) return null;
 
-    final afterScheme = trimmed.substring(scheme.length).trim();
+    try {
+      if (trimmed.startsWith(_connectPrefix)) {
+        return _parseV2(trimmed);
+      }
 
-    // 1. Прямая ссылка connect?
-    if (afterScheme.startsWith('connect?') || afterScheme.startsWith('?')) {
-      final resolved = afterScheme.startsWith('?')
-          ? '${scheme}connect$afterScheme'
-          : '${scheme}$afterScheme';
-      return _parseV2(resolved);
-    }
+      if (trimmed.contains('@')) {
+        final legacy = _parseLegacy(trimmed);
+        return legacy != null ? ParsedLinkResult(profile: legacy) : null;
+      }
 
-    // 2. Legacy csqtt://password@host:port
-    if (afterScheme.contains('@')) {
+      // Если ссылка зашифрована (csqtt://<base64>)
+      final decrypted = CsqttNativeCrypto.decrypt(trimmed);
+      if (decrypted != null && decrypted.isNotEmpty) {
+        final candidate = decrypted.startsWith('csqtt://connect?')
+            ? decrypted
+            : decrypted.startsWith('connect?')
+                ? '$scheme$decrypted'
+                : decrypted.startsWith('csqtt://')
+                    ? '${scheme}connect?${decrypted.substring(scheme.length)}'
+                    : '${scheme}connect?$decrypted';
+        final v2 = _parseV2(candidate);
+        if (v2 != null) return v2;
+      }
+
+      // Legacy csqtt://password@host:port (fallback)
       final legacy = _parseLegacy(trimmed);
       return legacy != null ? ParsedLinkResult(profile: legacy) : null;
+    } on FormatException {
+      return null;
+    } on ArgumentError {
+      return null;
     }
-
-    // 3. Зашифрованная csqtt://<base64> (AES-256-GCM)
-    final decrypted = CsqttNativeCrypto.decrypt(trimmed);
-    if (decrypted != null && decrypted.isNotEmpty) {
-      final candidate = decrypted.startsWith('csqtt://connect?')
-          ? decrypted
-          : decrypted.startsWith('connect?')
-              ? '${scheme}$decrypted'
-              : decrypted.startsWith('csqtt://')
-                  ? '${scheme}connect?${decrypted.substring(scheme.length)}'
-                  : '${scheme}connect?$decrypted';
-      return _parseV2(candidate);
-    }
-
-    return null;
   }
 
   ServerProfile? parse(String link) => parseLinkFull(link)?.profile;
 
   ParsedLinkResult? _parseV2(String link) {
-    final queryMap = _extractQueryParameters(link);
-    if (queryMap.isEmpty) return null;
+    final fixedLink = _separateParams(link);
+    final uri = Uri.tryParse(fixedLink);
+    if (uri == null) return null;
 
-    final v = queryMap['v']?.trim();
-    if (v != '2') return null;
+    final query = uri.queryParameters;
+    if (query['v'] != '2') return null;
 
-    final host = queryMap['host']?.trim();
-    final peer = queryMap['peer']?.trim();
-    final password = queryMap['password']?.trim();
-
+    final host = query['host']?.trim();
+    final peer = query['peer']?.trim();
+    final password = query['password'];
     if (host == null || host.isEmpty) return null;
     if (password == null || password.isEmpty) return null;
-    if (host == '0.0.0.0' || host == '127.0.0.1' || host.toLowerCase() == 'localhost' || host == '::1') {
-      return null;
-    }
 
     final port = int.tryParse(peer ?? '');
     if (!ImportService.isValidPort(port)) return null;
 
     // Hashes
-    final rawHashes = queryMap['hashes'];
+    final rawHashes = query['hashes'];
     final hashes = <String>[];
     if (rawHashes != null && rawHashes.isNotEmpty) {
       for (final part in rawHashes.split(RegExp(r'[+,]'))) {
-        final decoded = _decodeSafe(part).trim();
-        final stripped = stripVkCallUrl(decoded);
+        final stripped = stripVkCallUrl(part.trim());
         if (stripped.length >= 16 && !stripped.contains(RegExp(r'\s'))) {
           if (!hashes.contains(stripped)) {
             hashes.add(stripped);
@@ -232,26 +239,20 @@ class LinkParser {
     }
 
     // Token
-    final rawToken = queryMap['token'];
-    final token = rawToken != null && rawToken.isNotEmpty ? _decodeSafe(rawToken).trim() : null;
+    final rawToken = query['token']?.trim();
+    final token = (rawToken != null && rawToken.isNotEmpty) ? rawToken : null;
 
     // Workers
-    final rawWorkers = queryMap['workers'];
+    final rawWorkers = query['workers']?.trim();
     final workers = int.tryParse(rawWorkers ?? '');
     final power = workers != null ? closestWorkerStep(workers) : null;
 
     // Client name
-    final rawClient = queryMap['client'];
-    final clientName = rawClient != null && rawClient.isNotEmpty
-        ? _decodeSafe(rawClient).trim()
-        : null;
-
-    final profileName = (clientName != null && clientName.isNotEmpty)
-        ? clientName
-        : _generateName();
+    final rawClient = query['client']?.trim();
+    final clientName = (rawClient != null && rawClient.isNotEmpty) ? rawClient : null;
 
     final profile = ServerProfile(
-      name: profileName,
+      name: clientName ?? _generateName(),
       ip: host,
       port: port,
       password: password,
@@ -266,52 +267,12 @@ class LinkParser {
     );
   }
 
-  Map<String, String> _extractQueryParameters(String link) {
-    final queryStart = link.indexOf('?');
-    if (queryStart == -1) return const {};
-
-    final rawQuery = link.substring(queryStart + 1);
-    final sanitized = rawQuery.replaceAll('&amp;', '&');
-    final result = <String, String>{};
-
-    if (sanitized.contains('&') || sanitized.contains(';')) {
-      for (final part in sanitized.split(RegExp(r'[&;]'))) {
-        if (part.trim().isEmpty) continue;
-        final eq = part.indexOf('=');
-        if (eq <= 0) continue;
-        final key = _decodeSafe(part.substring(0, eq)).trim().toLowerCase();
-        final val = part.substring(eq + 1);
-        result[key] = val;
-      }
-      if (result.containsKey('host') && result.containsKey('peer')) {
-        return result;
-      }
+  String _separateParams(String link) {
+    var result = link;
+    for (final key in _knownKeys) {
+      result = result.replaceFirst('$key=', '&$key=');
     }
-
-    // Регулярка на случай слитных параметров (connect?v=2host=1.2.3.4peer=46000...)
-    final pattern = RegExp(
-      r'(?:^|[&;]|(?<=[a-zA-Z0-9_]))(v|host|peer|password|client|hashes|token|workers)=([^&?]*?)(?=(?:v|host|peer|password|client|hashes|token|workers)=|$)',
-      caseSensitive: false,
-    );
-    for (final m in pattern.allMatches(sanitized)) {
-      final key = _decodeSafe(m.group(1)!).trim().toLowerCase();
-      final val = m.group(2) ?? '';
-      result[key] = val;
-    }
-
     return result;
-  }
-
-  String _decodeSafe(String value) {
-    try {
-      return Uri.decodeQueryComponent(value.replaceAll('+', '%2B'));
-    } catch (_) {
-      try {
-        return Uri.decodeComponent(value);
-      } catch (_) {
-        return value;
-      }
-    }
   }
 
   ServerProfile? _parseLegacy(String link) {
@@ -390,7 +351,7 @@ class ImportService {
   static final LinkParser _parser = LinkParser();
 
   static final RegExp _linkPattern = RegExp(
-    r'csqtt://[^\s]+',
+    r'csqtt://\S+',
     caseSensitive: false,
   );
 
@@ -438,7 +399,6 @@ class ImportService {
       return const ImportResult(problem: ImportProblem.invalidFormat);
     }
 
-    // Сохраняем хеши и токены из ссылок в настройки
     final allHashes = <String>[];
     String? latestToken;
     for (final res in results) {
