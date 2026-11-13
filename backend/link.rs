@@ -27,12 +27,11 @@ pub fn decrypt_csqtt_link(raw_link: &str) -> Option<String> {
             let key = LessSafeKey::new(unbound);
             let mut iv = [0u8; 12];
             iv.copy_from_slice(&bytes[..12]);
-            if let Ok(nonce) = Nonce::try_assume_unique_for_key(&iv) {
-                let mut ciphertext = bytes[12..].to_vec();
-                if let Ok(decrypted) = key.open_in_place(nonce, Aad::empty(), &mut ciphertext) {
-                    if let Ok(s) = String::from_utf8(decrypted.to_vec()) {
-                        return Some(s);
-                    }
+            let nonce = Nonce::assume_unique_for_key(iv);
+            let mut ciphertext = bytes[12..].to_vec();
+            if let Ok(decrypted) = key.open_in_place(nonce, Aad::from(&[][..]), &mut ciphertext) {
+                if let Ok(s) = String::from_utf8(decrypted.to_vec()) {
+                    return Some(s);
                 }
             }
         }
@@ -61,20 +60,13 @@ pub fn encrypt_csqtt_link(payload: &str) -> String {
         let result = mac.finalize().into_bytes();
         iv.copy_from_slice(&result[..12]);
     } else {
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut iv);
+        iv = rand::random::<[u8; 12]>();
     }
-    let nonce = match Nonce::try_assume_unique_for_key(&iv) {
-        Ok(n) => n,
-        Err(_) => {
-            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
-            return format!("csqtt://{b64}");
-        }
-    };
+    let nonce = Nonce::assume_unique_for_key(iv);
 
     let mut in_out = payload.as_bytes().to_vec();
     if key
-        .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .seal_in_place_append_tag(nonce, Aad::from(&[][..]), &mut in_out)
         .is_err()
     {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
