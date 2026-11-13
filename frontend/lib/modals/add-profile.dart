@@ -1,5 +1,6 @@
 ﻿// SPDX-FileCopyrightText: 2026 luminescq
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'profile_form_components.dart';
@@ -102,14 +103,14 @@ class _AddProfileModalState extends State<AddProfileModal> {
       _power = closestWorkerStep(res.profile.power!).toDouble();
     }
     if (res.hashes.isNotEmpty) {
-      DbService.updateSettings((s) {
+      unawaited(DbService.updateSettings((s) {
         s.customHashes = res.hashes.join(',');
         s.hashes = 'Ручной';
         return s;
-      });
+      }));
     }
     if (res.token != null && res.token!.isNotEmpty) {
-      VkToken.save(res.token!);
+      unawaited(VkToken.save(res.token!));
     }
     setState(() {});
   }

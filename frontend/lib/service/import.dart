@@ -106,7 +106,7 @@ class CsqttNativeCrypto {
 
       final inputPtr = rawLink.toNativeUtf8();
       const outCap = 32768;
-      final outBuf = malloc<ffi.Uint8>(outCap);
+      final outBuf = calloc<ffi.Uint8>(outCap);
 
       try {
         final resultLen = decryptFn(inputPtr, outBuf, outCap);
@@ -115,8 +115,8 @@ class CsqttNativeCrypto {
           return utf8.decode(bytes);
         }
       } finally {
-        malloc.free(inputPtr);
-        malloc.free(outBuf);
+        calloc.free(inputPtr);
+        calloc.free(outBuf);
       }
     } catch (_) {}
     return null;
@@ -133,7 +133,7 @@ class CsqttNativeCrypto {
 
       final inputPtr = payload.toNativeUtf8();
       const outCap = 32768;
-      final outBuf = malloc<ffi.Uint8>(outCap);
+      final outBuf = calloc<ffi.Uint8>(outCap);
 
       try {
         final resultLen = encryptFn(inputPtr, outBuf, outCap);
@@ -142,8 +142,8 @@ class CsqttNativeCrypto {
           return utf8.decode(bytes);
         }
       } finally {
-        malloc.free(inputPtr);
-        malloc.free(outBuf);
+        calloc.free(inputPtr);
+        calloc.free(outBuf);
       }
     } catch (_) {}
     return null;
@@ -200,11 +200,15 @@ class LinkParser {
     final queryMap = _extractQueryParameters(link);
     if (queryMap.isEmpty) return null;
 
+    final v = queryMap['v']?.trim();
+    if (v != '2') return null;
+
     final host = queryMap['host']?.trim();
     final peer = queryMap['peer']?.trim();
-    final password = queryMap['password']?.trim() ?? '';
+    final password = queryMap['password']?.trim();
 
     if (host == null || host.isEmpty) return null;
+    if (password == null || password.isEmpty) return null;
     if (host == '0.0.0.0' || host == '127.0.0.1' || host.toLowerCase() == 'localhost' || host == '::1') {
       return null;
     }
