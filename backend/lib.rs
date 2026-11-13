@@ -1,17 +1,17 @@
-﻿// SPDX-FileCopyrightText: 2026 amurcanov
-// SPDX-FileCopyrightText: 2026 luminescq
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-// [FOCSQ] Файл заменяет main.rs оригинала csqtt: ядро собрано как библиотека
-// csqtt-core для встраивания в хост-приложение (flutter_rust_bridge) —
+// [DESKTOP] Ядро csqtt v2.5.0 как библиотека csqtt-core для десктоп-приложения:
 // CLI/stdin-цикл убран, управление через submit_control_line (mpsc),
 // события включаются принудительно (EVENTS_FORCED), отмена — через CancellationToken.
 
 mod auth;
 mod captcha;
 mod captcha_slider;
+mod cpu_task;
+pub mod direct_relay;
 mod dispatcher;
 mod dns;
+#[path = "shared/dtls.rs"]
+pub mod dtls;
 mod events;
 mod logging;
 mod namegen;
@@ -20,50 +20,45 @@ mod packet;
 mod profiles;
 mod repair;
 mod protocol;
-#[path = "shared/selective_fec.rs"]
-mod selective_fec;
 mod session;
+mod sni;
+#[path = "shared/spsc_ring.rs"]
+mod spsc_ring;
+mod srtp_mode;
 mod stats;
-#[path = "shared/striped_scheduler.rs"]
-mod striped_scheduler;
 mod stun_codec;
 mod turn_endpoint;
+mod turn_ip_pool;
 mod turn_stream;
-mod udp_batch;
-#[cfg(target_os = "linux")]
-// [FOCSQ] Нативный Linux TUN (/dev/net/tun + netlink-маршруты)
-pub mod tun_linux;
 mod turn;
 mod turn_core;
- mod vk_js_calls;
+mod vk_js_calls;
+#[path = "shared/wire_protocol.rs"]
+mod wire_protocol;
+#[cfg(target_os = "linux")]
+// [DESKTOP] Нативный Linux TUN (/dev/net/tun + netlink-маршруты)
+pub mod tun_linux;
 #[cfg(windows)]
-// [FOCSQ] pub: мост (rust_lib_frontend) вызывает set_dll_path_override
+// [DESKTOP] pub: GUI-мост вызывает set_dll_path_override
 pub mod tun_win;
 mod worker;
 mod wrap;
-// [FOCSQ] Общие модули апстрима v2.1.9 (shared/): кадрирование потоков
-// и ревизия wire-протокола нужны новому диспетчеру/сессиям
-#[path = "shared/flow_frame.rs"]
-mod flow_frame;
-#[path = "shared/wire_protocol.rs"]
-mod wire_protocol;
-mod client_perf;
-mod cpu_task;
 
 use anyhow::{Context, Result, bail};
 use auth::{VkAuth, VkHashCheck};
 use captcha::CaptchaSolver;
-use dispatcher::Dispatcher;
+use dispatcher::{Dispatcher, Termination};
 use events::Events;
 use obfs::ObfsMode;
 use packet::{PacketPool, packet_pool_size};
+use srtp_mode::SrtpMode;
 use stats::Stats;
 use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -71,25 +66,29 @@ use tokio_util::sync::CancellationToken;
 use repair::RepairState;
 use session::ShutdownCoordinator;
 use turn_endpoint::TurnTransportMode;
+use turn_ip_pool::{TurnIpPool, parse_custom_turn_ips};
 use worker::{
     GROUPS_PER_CREDENTIAL, GroupContext, PauseGate, RuntimeParams, WORKER_START_INTERVAL,
     WORKERS_PER_GROUP, WorkerStartPacer, parse_hashes, run_groups,
 };
-
-const GROUPS_PER_VK_HASH: usize = 3;
-const MAX_VK_HASHES: usize = 6;
-const MAX_WORKERS: usize = MAX_VK_HASHES * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
 use wrap::derive_wrap_key;
+
+const MAX_VK_HASHES: usize = 6;
+pub const MAX_WORKERS: usize = 100;
+const STREAMS_PER_RUNTIME_WORKER: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub turn: String,
+    pub custom_turn_ips: String,
     pub port: String,
     pub listen: String,
     pub vk: String,
     pub vk_hash_mode: String,
     pub peer: String,
     pub workers: usize,
+    pub runtime_threads: usize,
+    pub exact_workers: bool,
     pub allow_hash_redistribution: bool,
     pub device_id: String,
     pub password: String,
@@ -98,23 +97,37 @@ pub struct ClientConfig {
     pub fingerprint: String,
     pub client_ids: String,
     pub obfs: String,
+    pub turn_transport: String,
+    pub srtp_mode: String,
     pub generation: u64,
     pub salt: String,
     pub tun_uds: String,
     pub validate_vk_hashes: bool,
     pub vk_js_token: String,
+    pub domain_routing: bool,
+    pub exclude_ru_zones: bool,
+    pub template_domains: bool,
+    pub domain_whitelist: bool,
+    pub direct_domains: String,
+    pub domains_file: Vec<String>,
+    pub ip_routing: bool,
+    pub ip_whitelist: bool,
+    pub direct_ips: String,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             turn: "".to_string(),
+            custom_turn_ips: "".to_string(),
             port: "".to_string(),
             listen: "127.0.0.1:9000".to_string(),
             vk: "".to_string(),
             vk_hash_mode: "manual".to_string(),
             peer: "".to_string(),
             workers: 18,
+            runtime_threads: 0,
+            exact_workers: false,
             allow_hash_redistribution: false,
             device_id: "unknown".to_string(),
             password: "".to_string(),
@@ -123,11 +136,22 @@ impl Default for ClientConfig {
             fingerprint: "chrome".to_string(),
             client_ids: "".to_string(),
             obfs: "audio".to_string(),
+            turn_transport: "udp".to_string(),
+            srtp_mode: "auto".to_string(),
             generation: 0,
             salt: "".to_string(),
             tun_uds: "".to_string(),
             validate_vk_hashes: false,
             vk_js_token: "".to_string(),
+            domain_routing: false,
+            exclude_ru_zones: false,
+            template_domains: false,
+            domain_whitelist: false,
+            direct_domains: "".to_string(),
+            domains_file: Vec::new(),
+            ip_routing: false,
+            ip_whitelist: false,
+            direct_ips: "".to_string(),
         }
     }
 }
@@ -143,6 +167,11 @@ static EVENTS_FORCED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_events_enabled(enabled: bool) {
     EVENTS_FORCED.store(enabled, Ordering::Release);
+}
+
+/// Есть активный решатель капчи — GUI показывает поле ответа.
+pub fn captcha_active() -> bool {
+    ACTIVE_CAPTCHA.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
 /// Канал управления активной сессией (замена stdin для встроенного режима)
@@ -183,6 +212,27 @@ fn set_active_captcha(solver: Arc<CaptchaSolver>) {
     }
 }
 
+pub fn runtime_worker_threads(requested_workers: usize, configured_threads: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    runtime_worker_threads_with_limit(requested_workers, configured_threads, available)
+}
+
+fn runtime_worker_threads_with_limit(
+    requested_workers: usize,
+    configured_threads: usize,
+    available_threads: usize,
+) -> usize {
+    let available = available_threads.max(1);
+    if configured_threads != 0 {
+        return configured_threads.clamp(1, available);
+    }
+    normalize_worker_count(requested_workers)
+        .div_ceil(STREAMS_PER_RUNTIME_WORKER)
+        .clamp(1, available)
+}
+
 fn clear_active_captcha() {
     if let Ok(mut guard) = ACTIVE_CAPTCHA.lock() {
         *guard = None;
@@ -204,23 +254,35 @@ pub fn submit_captcha_result(result: String) -> bool {
 
 pub async fn run_client(arguments: ClientConfig, external_cancel: Option<CancellationToken>) -> Result<()> {
     if arguments.validate_vk_hashes {
-        return run_vk_hash_validation(&arguments).await;
+        run_vk_hash_validation(&arguments).await?;
+        return Ok(());
     }
     let js_hash_mode = arguments.vk_hash_mode == "auto_js";
-    let js_auth_mode = arguments.vk_auth_mode == "auto_js";
-    if js_auth_mode && !js_hash_mode {
-        bail!("[КЛИЕНТ] Режим авторизации Auto JS требует режим хешей Auto JS");
-    }
+    let mut vk_auth_mode = arguments.vk_auth_mode.clone();
+    let js_auth_mode = if vk_auth_mode == "auto_js" && !js_hash_mode {
+        crate::log_error!(
+            "[КЛИЕНТ] Предупреждение: режим Auto JS неприменим без хешей Auto JS, переключаем на vkcalls"
+        );
+        vk_auth_mode = "vkcalls".to_owned();
+        false
+    } else {
+        vk_auth_mode == "auto_js"
+    };
     if arguments.peer.is_empty() || (!js_hash_mode && arguments.vk.is_empty()) {
         bail!("[КЛИЕНТ] Нужны -peer и хеши VK");
     }
-    if arguments.password.is_empty() {
-        bail!("[КЛИЕНТ] Нужен -password: WRAP ключ выводится из пароля подключения");
+    // [DESKTOP] Пароль передаёт GUI через ClientConfig (env-вариант CLI не нужен).
+    let password = arguments.password.clone();
+    if password.is_empty() {
+        bail!("[КЛИЕНТ] Нужен пароль подключения (ClientConfig.password)");
     }
     let peer = resolve_peer(&arguments.peer).await?;
     let mode = ObfsMode::parse(&arguments.obfs)?;
+    let turn_transport = TurnTransportMode::parse(&arguments.turn_transport)?;
+    let srtp_mode = SrtpMode::parse(&arguments.srtp_mode)?;
     let session_profile = profiles::random_profile(&arguments.fingerprint);
     let wrap_key = derive_wrap_key(&arguments.password)?;
+    let client_wrap_key = wrap_key;
     let mut js_calls = None;
     let mut js_credential_broker = None;
     let hash_source = if js_hash_mode {
@@ -230,9 +292,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         let bootstrap = vk_js_calls::Bootstrap {
             token: arguments.vk_js_token.trim().to_owned(),
         };
-        let started =
-            vk_js_calls::start(bootstrap, &arguments.device_id, js_auth_mode, &session_profile)
-                .await?;
+        let started = vk_js_calls::start(bootstrap, js_auth_mode, &session_profile).await?;
         let hashes = started.hashes.join(",");
         js_calls = Some(started.active);
         js_credential_broker = Some(started.credential_broker);
@@ -247,18 +307,17 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     if hashes.is_empty() {
         bail!("[КЛИЕНТ] Нет хешей VK");
     }
-    let workers = normalize_worker_count_for_hashes(
-        arguments.workers,
-        hashes.len(),
-        arguments.allow_hash_redistribution || js_hash_mode,
-    );
-    let groups = workers / WORKERS_PER_GROUP;
+    let workers = if arguments.exact_workers {
+        arguments.workers.clamp(3, MAX_WORKERS)
+    } else {
+        normalize_worker_count(arguments.workers)
+    };
+    let groups = workers.div_ceil(WORKERS_PER_GROUP);
     let cancel = external_cancel.unwrap_or_else(CancellationToken::new);
-    // [FOCSQ] VK API — CDN с ротацией IP: резолвим хосты сразу (пока DNS
+    // [DESKTOP] VK API — CDN с ротацией IP: резолвим хосты сразу (пока DNS
     // не перехвачен) и повторяем в течение сессии, добавляя свежие адреса
-    // в исключения тюна. Иначе после 0/1+128/1 запросы vkcalls/auto_js
-    // уходят в туннель на невыключенный CDN-IP и отваливаются — путь
-    // звонков деградирует до капчи.
+    // в исключения тюна. Иначе после старта туннеля запросы vkcalls/auto_js
+    // уходят в туннель на невыключенный CDN-IP и отваливаются.
     #[cfg(any(windows, target_os = "linux"))]
     schedule_vk_endpoint_excludes(cancel.clone());
     let captcha = CaptchaSolver::new(&arguments.captcha_mode, cancel.clone());
@@ -276,7 +335,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         .map(str::to_owned)
         .collect();
     let auth = Arc::new(VkAuth::new(
-        &arguments.vk_auth_mode,
+        &vk_auth_mode,
         session_profile,
         &client_ids,
         captcha.clone(),
@@ -287,20 +346,35 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     let finish_js_calls = Arc::new(AtomicBool::new(false));
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     set_control_channel(control_tx);
-    let control_task = start_control_input(
-        cancel.clone(),
-        paused.clone(),
-        captcha.clone(),
-        events.clone(),
-        finish_js_calls.clone(),
-        control_rx,
-    );
     let parent_task = start_parent_monitor(cancel.clone());
     events.process(std::process::id());
-    let pool = PacketPool::new(packet_pool_size(workers));
+    let pool = PacketPool::new(packet_pool_size(MAX_WORKERS));
     let tun_uds = (!arguments.tun_uds.is_empty()).then_some(arguments.tun_uds.clone());
-    // [FOCSQ] Нативный TUN: ядро само создаёт интерфейс и применяет TUNCONF.
-    // Windows — «wintun», Linux — «tun» (имя интерфейса по умолчанию csqtt).
+    let mut direct_domains = crate::sni::parse_direct_domains(&arguments.direct_domains);
+    for file_path in &arguments.domains_file {
+        if let Ok(content) = std::fs::read_to_string(file_path) {
+            let file_domains = crate::sni::parse_direct_domains(&content);
+            for domain in file_domains {
+                if !direct_domains.contains(&domain) {
+                    direct_domains.push(domain);
+                }
+            }
+        }
+    }
+    direct_domains.truncate(1024);
+    let ip_rules = crate::sni::parse_ip_rules(&arguments.direct_ips);
+    let domain_routing = dispatcher::DomainRoutingConfig {
+        enabled: arguments.domain_routing,
+        exclude_ru_zones: arguments.exclude_ru_zones,
+        template_domains: arguments.template_domains,
+        direct_domains: Arc::new(direct_domains),
+        is_whitelist: arguments.domain_whitelist,
+        ip_routing_enabled: arguments.ip_routing,
+        ip_is_whitelist: arguments.ip_whitelist,
+        ip_rules: Arc::new(ip_rules),
+    };
+    // [DESKTOP] Нативный TUN: ядро само создаёт интерфейс и применяет TUNCONF.
+    // Windows — «wintun», Linux — имя интерфейса (по умолчанию csqtt).
     #[cfg(windows)]
     let native_tun = arguments.tun_uds.eq_ignore_ascii_case("wintun");
     #[cfg(target_os = "linux")]
@@ -308,12 +382,14 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     #[cfg(not(any(windows, target_os = "linux")))]
     let native_tun = false;
     let tun_peer_ip = native_tun.then(|| peer.ip().to_string());
-    let dispatcher_result = Dispatcher::start(
+    let dispatcher_result = Dispatcher::start_with_domain_routing(
         &arguments.listen,
         tun_uds,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
+        domain_routing,
+        workers,
     )
     .await;
     let (dispatcher, local_port) = match dispatcher_result {
@@ -325,35 +401,55 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
             return Err(error);
         }
     };
+    let control_task = start_control_input(
+        cancel.clone(),
+        paused.clone(),
+        captcha,
+        events.clone(),
+        finish_js_calls.clone(),
+        dispatcher.clone(),
+        control_rx,
+    );
     let local_port: Arc<str> = Arc::from(local_port);
-    // [FOCSQ] Десктоп ходит UDP-транспортом; TLS-транспорт (v2.1.9) пока
-    // включается только на Android через аргумент CLI
-    let turn_transport = TurnTransportMode::parse("udp")?;
+    let raw_turn_ips = if !arguments.custom_turn_ips.is_empty() {
+        &arguments.custom_turn_ips
+    } else {
+        &arguments.turn
+    };
+    let turn_ip_pool = Arc::new(TurnIpPool::new(
+        parse_custom_turn_ips(raw_turn_ips),
+        MAX_WORKERS,
+    ));
+    let initial_workers = workers;
+    let scale_notify = Arc::new(tokio::sync::Notify::new());
+    let params_workers = Arc::new(AtomicUsize::new(initial_workers));
     let params = Arc::new(RuntimeParams {
         peer,
         turn_host: (!arguments.turn.is_empty()).then(|| Arc::from(arguments.turn.as_str())),
         turn_port: (!arguments.port.is_empty()).then(|| Arc::from(arguments.port.as_str())),
+        turn_ip_pool,
         turn_transport,
+        srtp_mode,
         hashes: hashes.into(),
         wrap_key,
+        client_wrap_key,
         mode,
         generation: arguments.generation,
         salt: Arc::from(arguments.salt.as_str()),
         local_port: local_port.clone(),
-        device_id: Arc::from(arguments.device_id.as_str()),
-        password: Arc::from(arguments.password.as_str()),
-        workers,
+        password: Arc::from(password.as_str()),
+        workers: params_workers,
+        configured_workers: workers,
     });
     print_configuration(
         &arguments,
         auth.client_ids(),
         workers,
         groups,
-        params.hashes.len(),
+        &params,
         &local_port,
-        params.turn_transport,
     );
-    let repair = RepairState::new(workers);
+    let repair = RepairState::new(MAX_WORKERS);
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
@@ -423,6 +519,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         repair,
         shutdown: Arc::new(ShutdownCoordinator::new()),
         cancel: cancel.clone(),
+        scale_notify,
     });
     let required_ready_bots = required_js_ready_bots(groups);
     if js_auth_mode {
@@ -438,7 +535,15 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         _ => None,
     };
     let shutdown_events = events.clone();
-    let groups_future = run_groups(groups, context);
+    let tun_lost_events = events.clone();
+    let tun_io_lost = dispatcher.tun_io_lost.clone();
+    tokio::spawn(async move {
+        loop {
+            tun_io_lost.notified().await;
+            tun_lost_events.tun_lost();
+        }
+    });
+    let groups_future = run_groups(context);
     tokio::pin!(groups_future);
     let groups_completed = tokio::select! {
         _ = &mut groups_future => true,
@@ -499,11 +604,14 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     let _ = native_tun;
+    let termination = dispatcher.termination();
     shutdown_events.stopped();
     crate::log_error!("[КЛИЕНТ] Все воркеры завершены");
-    // НЕ выключаем логгер — он должен жить между перезапусками в Flutter
-    // let _ = logging::shutdown(Duration::from_secs(1));
-    Ok(())
+    match termination {
+        None => Ok(()),
+        Some(Termination::TunLost) => bail!("TUN потерян"),
+        Some(Termination::Fatal) => bail!("аварийное завершение TUN или UDP задачи"),
+    }
 }
 
 async fn leave_js_creator_after_ready_workers(
@@ -545,23 +653,14 @@ fn required_js_ready_bots(groups: usize) -> usize {
 }
 
 fn normalize_worker_count(requested: usize) -> usize {
+    if requested <= 5 {
+        return 5;
+    }
     requested.clamp(WORKERS_PER_GROUP, MAX_WORKERS) / WORKERS_PER_GROUP * WORKERS_PER_GROUP
 }
 
-fn normalize_worker_count_for_hashes(
-    requested: usize,
-    hash_count: usize,
-    allow_hash_redistribution: bool,
-) -> usize {
-    if allow_hash_redistribution {
-        return normalize_worker_count(requested);
-    }
-    let maximum = hash_count.clamp(1, MAX_VK_HASHES) * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
-    normalize_worker_count(requested).min(maximum)
-}
-
-fn should_leave_js_creator(_js_hash_mode: bool, _js_auth_mode: bool) -> bool {
-    false
+fn should_leave_js_creator(js_hash_mode: bool, js_auth_mode: bool) -> bool {
+    js_hash_mode && js_auth_mode
 }
 
 pub async fn run_vk_hash_validation(arguments: &ClientConfig) -> Result<()> {
@@ -669,6 +768,7 @@ fn start_control_input(
     captcha: Arc<CaptchaSolver>,
     events: Events,
     finish_js_calls: Arc<AtomicBool>,
+    dispatcher: Arc<Dispatcher>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -688,8 +788,8 @@ fn start_control_input(
                 },
             };
             let line = line.trim();
-            if !line.contains("error:tunnel stopped") {
-                crate::log_error!("[УПР] {line}");
+            if !line.contains("error:tunnel stopped") && line != "FINISH_VK_CALLS" {
+                crate::log_error!("[УПР] {}", loggable_stdin_line(line));
             }
             match line {
                 "PAUSE" => paused.set_paused(true),
@@ -709,11 +809,23 @@ fn start_control_input(
                                 "[КАПЧА] Канал результата уже заполнен, устаревший ответ отклонён"
                             );
                         }
+                    } else if let Some(payload) = line.strip_prefix("UPDATE_DOMAINS|") {
+                        dispatcher.update_domain_routing(payload);
                     }
                 }
             }
         }
     })
+}
+
+fn loggable_stdin_line(line: &str) -> &str {
+    if line.starts_with("CAPTCHA_RESULT|") {
+        "CAPTCHA_RESULT|<скрыто>"
+    } else if line.starts_with("VK_JS_BOOTSTRAP:") {
+        "VK_JS_BOOTSTRAP:<скрыто>"
+    } else {
+        line
+    }
 }
 
 fn start_parent_monitor(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
@@ -742,10 +854,12 @@ fn print_configuration(
     client_ids: String,
     workers: usize,
     groups: usize,
-    hashes: usize,
+    params: &RuntimeParams,
     local_port: &str,
-    turn_transport: TurnTransportMode,
 ) {
+    let hashes = params.hashes.len();
+    let turn_transport = params.turn_transport;
+    let srtp_mode = params.srtp_mode;
     let captcha = match arguments.captcha_mode.as_str() {
         "wv" => "WBV selected in Android",
         "rjs" => "RJS Rust v2 with WBV Auto fallback",
@@ -763,13 +877,28 @@ fn print_configuration(
         arguments.peer
     );
     crate::log_error!(
-        "[КЛИЕНТ] Протокол: TURN {} | WRAP: ON | obfs={}",
-        turn_transport.as_str().to_ascii_uppercase(),
-        arguments.obfs
+        "[КЛИЕНТ] TURN: {} | SRTP: {} | DTLS: 1.2 (ECDSA P-256) | WRAP: ON | obfs={}",
+        turn_transport.as_str(),
+        srtp_mode.as_str(),
+        arguments.obfs,
     );
     crate::log_error!("[WRAP] WRAP Ключ вычислен ✓");
-    crate::log_error!("[КЛИЕНТ] Device ID: {}", arguments.device_id);
     crate::log_error!("[КЛИЕНТ] Captcha: {captcha}");
+    if arguments.domain_routing {
+        crate::log_error!(
+            "[КЛИЕНТ] Доменная маршрутизация: ВКЛ (RU/SU/РФ: {}, кастомных доменов: {})",
+            if arguments.exclude_ru_zones {
+                "ДА"
+            } else {
+                "НЕТ"
+            },
+            arguments
+                .direct_domains
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .count()
+        );
+    }
     crate::log_error!("[КЛИЕНТ] ═══════════════════════════════════════");
 }
 
@@ -778,56 +907,58 @@ mod worker_count_tests {
     use super::*;
 
     #[test]
-    fn every_supported_total_maps_to_complete_nine_allocation_groups() {
+    fn every_supported_total_maps_to_complete_allocation_groups() {
         for groups in 1..=MAX_WORKERS / WORKERS_PER_GROUP {
             let workers = groups * WORKERS_PER_GROUP;
             assert_eq!(normalize_worker_count(workers), workers);
             assert_eq!(workers / WORKERS_PER_GROUP, groups);
         }
-        assert_eq!(normalize_worker_count(MAX_WORKERS), 162);
+        assert_eq!(normalize_worker_count(MAX_WORKERS), 100);
     }
 
     #[test]
     fn invalid_totals_never_create_partial_or_excess_group() {
         for requested in 0..=1_000 {
             let workers = normalize_worker_count(requested);
-            assert!((WORKERS_PER_GROUP..=MAX_WORKERS).contains(&workers));
-            assert_eq!(workers % WORKERS_PER_GROUP, 0);
+            if requested <= 5 {
+                assert_eq!(workers, 5);
+            } else {
+                assert!((WORKERS_PER_GROUP..=MAX_WORKERS).contains(&workers));
+                assert_eq!(workers % WORKERS_PER_GROUP, 0);
+            }
         }
     }
 
     #[test]
-    fn hash_count_caps_native_worker_admission_to_twenty_seven_each() {
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 1, false), 27);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 4, false), 108);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 135);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 162);
-        assert_eq!(
-            normalize_worker_count_for_hashes(usize::MAX, 100, false),
-            162
+    fn runtime_thread_budget_follows_stream_budget_and_cpu_limit() {
+        assert_eq!(runtime_worker_threads_with_limit(5, 0, 16), 1);
+        assert_eq!(runtime_worker_threads_with_limit(10, 0, 16), 2);
+        assert_eq!(runtime_worker_threads_with_limit(15, 0, 16), 2);
+        assert_eq!(runtime_worker_threads_with_limit(20, 0, 16), 3);
+        assert_eq!(runtime_worker_threads_with_limit(30, 0, 16), 4);
+        assert_eq!(runtime_worker_threads_with_limit(50, 0, 16), 7);
+        assert_eq!(runtime_worker_threads_with_limit(100, 0, 16), 13);
+        assert_eq!(runtime_worker_threads_with_limit(100, 3, 16), 3);
+        assert_eq!(runtime_worker_threads_with_limit(100, 32, 16), 16);
+    }
+
+    #[test]
+    fn native_worker_normalization_is_bounded_and_group_aligned() {
+        assert_eq!(normalize_worker_count(usize::MAX), MAX_WORKERS);
+        assert_eq!(normalize_worker_count(usize::MAX - 1), MAX_WORKERS);
+        assert_eq!(normalize_worker_count(48), 40);
+        assert_eq!(normalize_worker_count(5), 5);
+        assert_eq!(normalize_worker_count(4), 5);
+        assert!(
+            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL)
+                <= vk_js_calls::MAX_ACCOUNT_CREDENTIALS
         );
     }
 
     #[test]
-    fn automatic_call_failure_may_redistribute_complete_groups() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 162);
-        assert_eq!(normalize_worker_count_for_hashes(54, 1, true), 54);
-        assert_eq!(normalize_worker_count_for_hashes(50, 1, true), 45);
-    }
-
-    #[test]
-    fn auto_js_account_auth_supports_nine_credentials_in_one_call() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 162);
-        assert_eq!(
-            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL),
-            vk_js_calls::MAX_ACCOUNT_CREDENTIALS
-        );
-    }
-
-    #[test]
-    fn auto_js_always_keeps_creator_while_running() {
+    fn auto_js_leaves_creator_only_when_both_modes_are_active() {
         assert!(!should_leave_js_creator(true, false));
-        assert!(!should_leave_js_creator(true, true));
+        assert!(should_leave_js_creator(true, true));
         assert!(!should_leave_js_creator(false, false));
         assert!(!should_leave_js_creator(false, true));
     }
@@ -835,12 +966,12 @@ mod worker_count_tests {
     #[test]
     fn auto_js_waits_for_at_most_two_independent_turn_bots() {
         assert_eq!(required_js_ready_bots(1), 1);
-        assert_eq!(required_js_ready_bots(2), 1);
+        assert_eq!(required_js_ready_bots(2), 2);
         assert_eq!(required_js_ready_bots(3), 2);
+        assert_eq!(required_js_ready_bots(4), 2);
+        assert_eq!(required_js_ready_bots(13), 2);
         assert_eq!(required_js_ready_bots(18), 2);
     }
-
-
 
     #[tokio::test]
     async fn js_creator_waits_for_every_distinct_ready_credential() {
@@ -857,5 +988,21 @@ mod worker_count_tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(!wait_for_js_credential_readiness(receiver, 1, cancel).await);
+    }
+
+    // [DESKTOP] Тесты stdin-bootstrap и clap-аргументов удалены:
+    // CLI/stdin-механизм в библиотечной сборке отсутствует.
+
+    #[test]
+    fn captcha_and_bootstrap_payloads_are_redacted_in_stdin_logs() {
+        assert_eq!(
+            loggable_stdin_line("CAPTCHA_RESULT|secret-token"),
+            "CAPTCHA_RESULT|<скрыто>"
+        );
+        assert_eq!(
+            loggable_stdin_line("VK_JS_BOOTSTRAP:abc"),
+            "VK_JS_BOOTSTRAP:<скрыто>"
+        );
+        assert_eq!(loggable_stdin_line("PAUSE"), "PAUSE");
     }
 }

@@ -4,7 +4,7 @@
   # FOCSQ
 
   <p><strong>Десктопный клиент многопоточного QUIC/TURN-туннеля</strong><br>
-  <sub>Форк <a href="https://github.com/amurcanov/csqtt">csqtt</a> для ПК</sub></p>
+  <sub>Форк с поддержкой протокола <strong>csqtt v2.5.0</strong> и нативным Flutter UI</sub></p>
 
   <p>
     <img src="https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0wIDMuNDQ5TDkuNzUgMi4xLjk0NTFIMG0xMC45NDktOS42MDJMMjQgMHYxMS40SDEwLjk0OU0wIDEyLjZoOS43NXY5LjQ1MUwwIDIwLjY5OU0xMC45NDkgMTIuNkgyNFYyNGwtMTIuOTAxLTEuODAxIi8+PC9zdmc+&logoColor=white" alt="Windows">
