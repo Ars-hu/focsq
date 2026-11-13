@@ -270,7 +270,7 @@ jobs:
         run: |
           ls -lh dist/
           TAG="${GITHUB_REF_NAME}"
-          if [ "$TAG" = "main" ]; then TAG="v2.5.0"; fi
+          if [ "$TAG" = "main" ]; then TAG="v2.5.1"; fi
           gh release delete "$TAG" --yes 2>/dev/null || true
           gh release create "$TAG" \
             --title "FOCSQ $TAG" \

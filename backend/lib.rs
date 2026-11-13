@@ -12,6 +12,7 @@ mod dispatcher;
 mod dns;
 #[path = "shared/dtls.rs"]
 pub mod dtls;
+pub mod link;
 mod events;
 mod logging;
 mod namegen;

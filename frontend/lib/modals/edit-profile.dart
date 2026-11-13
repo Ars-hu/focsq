@@ -7,6 +7,7 @@ import '../models/server_profile.dart';
 import '../service/alert.dart';
 import '../service/db.dart';
 import '../service/import.dart';
+import '../service/vk/token.dart';
 
 class EditProfileModal extends StatefulWidget {
   final ServerProfile profile;
@@ -71,10 +72,37 @@ class _EditProfileModalState extends State<EditProfileModal> {
     _power = widget.profile.power != null
         ? closestWorkerStep(widget.profile.power!).toDouble()
         : 10;
-    _ipCtrl.addListener(() => _clearError(() => _ipError = null));
+    _ipCtrl.addListener(_onIpChanged);
     _portCtrl.addListener(() => _clearError(() => _portError = null));
     _passCtrl.addListener(() => _clearError(() => _passError = null));
     _loadMaxPower();
+  }
+
+  void _onIpChanged() {
+    _clearError(() => _ipError = null);
+    final text = _ipCtrl.text.trim();
+    if (text.toLowerCase().startsWith('csqtt://')) {
+      final parsed = ImportService.parseCsqttLink(text);
+      if (parsed != null) {
+        _ipCtrl.text = parsed.profile.ip ?? '';
+        _portCtrl.text = parsed.profile.port?.toString() ?? '';
+        _passCtrl.text = parsed.profile.password ?? '';
+        if (parsed.profile.power != null) {
+          _power = closestWorkerStep(parsed.profile.power!).toDouble();
+        }
+        if (parsed.hashes.isNotEmpty) {
+          DbService.updateSettings((s) {
+            s.customHashes = parsed.hashes.join(',');
+            s.hashes = 'Ручной';
+            return s;
+          });
+        }
+        if (parsed.token != null && parsed.token!.isNotEmpty) {
+          VkToken.save(parsed.token!);
+        }
+        setState(() {});
+      }
+    }
   }
 
   void _clearError(VoidCallback clear) {
@@ -171,7 +199,7 @@ class _EditProfileModalState extends State<EditProfileModal> {
                     children: [
                       Expanded(
                         child: CustomTextField(
-                          hint: 'IP-адрес',
+                          hint: 'IP или ссылка csqtt://',
                           controller: _ipCtrl,
                           error: _ipError,
                         ),

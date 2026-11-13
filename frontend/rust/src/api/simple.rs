@@ -203,3 +203,57 @@ pub async fn start_csqtt_client(config: AppClientConfig) -> anyhow::Result<()> {
     result?;
     Ok(())
 }
+
+#[no_mangle]
+pub extern "C" fn focsq_decrypt_csqtt_link(
+    input_ptr: *const std::os::raw::c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    if input_ptr.is_null() || out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let c_str = unsafe { std::ffi::CStr::from_ptr(input_ptr) };
+    let input = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    if let Some(decrypted) = csqtt_core::link::decrypt_csqtt_link(input) {
+        let bytes = decrypted.as_bytes();
+        if bytes.len() > out_cap {
+            return -3;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+        }
+        bytes.len() as i32
+    } else {
+        -4
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn focsq_encrypt_csqtt_link(
+    input_ptr: *const std::os::raw::c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    if input_ptr.is_null() || out_buf.is_null() || out_cap == 0 {
+        return -1;
+    }
+    let c_str = unsafe { std::ffi::CStr::from_ptr(input_ptr) };
+    let input = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let encrypted = csqtt_core::link::encrypt_csqtt_link(input);
+    let bytes = encrypted.as_bytes();
+    if bytes.len() > out_cap {
+        return -3;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+    }
+    bytes.len() as i32
+}
+

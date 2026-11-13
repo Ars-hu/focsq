@@ -8,6 +8,7 @@ import '../models/server_profile.dart';
 import '../service/alert.dart';
 import '../service/db.dart';
 import '../service/import.dart';
+import '../service/vk/token.dart';
 
 class AddProfileModal extends StatefulWidget {
   const AddProfileModal({super.key});
@@ -59,10 +60,58 @@ class _AddProfileModalState extends State<AddProfileModal> {
   void initState() {
     super.initState();
     _nameCtrl.text = 'Узел #${math.Random().nextInt(9000) + 1000}';
-    _ipCtrl.addListener(() => _clearError(() => _ipError = null));
+    _ipCtrl.addListener(_onIpChanged);
+    _nameCtrl.addListener(_onNameChanged);
     _portCtrl.addListener(() => _clearError(() => _portError = null));
     _passCtrl.addListener(() => _clearError(() => _passError = null));
     _loadMaxPower();
+  }
+
+  void _onIpChanged() {
+    _clearError(() => _ipError = null);
+    final text = _ipCtrl.text.trim();
+    if (text.toLowerCase().startsWith('csqtt://')) {
+      final parsed = ImportService.parseCsqttLink(text);
+      if (parsed != null) {
+        _applyParsedLink(parsed);
+      }
+    }
+  }
+
+  void _onNameChanged() {
+    final text = _nameCtrl.text.trim();
+    if (text.toLowerCase().startsWith('csqtt://')) {
+      final parsed = ImportService.parseCsqttLink(text);
+      if (parsed != null) {
+        _nameCtrl.text = 'Узел #${math.Random().nextInt(9000) + 1000}';
+        _applyParsedLink(parsed);
+      }
+    }
+  }
+
+  void _applyParsedLink(ParsedLinkResult res) {
+    _ipCtrl.text = res.profile.ip ?? '';
+    _portCtrl.text = res.profile.port?.toString() ?? '';
+    _passCtrl.text = res.profile.password ?? '';
+    if (res.profile.name != null &&
+        res.profile.name!.isNotEmpty &&
+        !res.profile.name!.startsWith('Сервер #')) {
+      _nameCtrl.text = res.profile.name!;
+    }
+    if (res.profile.power != null) {
+      _power = closestWorkerStep(res.profile.power!).toDouble();
+    }
+    if (res.hashes.isNotEmpty) {
+      DbService.updateSettings((s) {
+        s.customHashes = res.hashes.join(',');
+        s.hashes = 'Ручной';
+        return s;
+      });
+    }
+    if (res.token != null && res.token!.isNotEmpty) {
+      VkToken.save(res.token!);
+    }
+    setState(() {});
   }
 
   void _clearError(VoidCallback clear) {
@@ -150,7 +199,7 @@ class _AddProfileModalState extends State<AddProfileModal> {
                     children: [
                       Expanded(
                         child: CustomTextField(
-                          hint: 'IP-адрес',
+                          hint: 'IP или ссылка csqtt://',
                           controller: _ipCtrl,
                           error: _ipError,
                         ),
