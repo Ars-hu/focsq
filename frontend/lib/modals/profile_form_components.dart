@@ -4,19 +4,30 @@ import 'package:flutter/material.dart';
 import '../models/app_settings.dart';
 import '../theme/app_colors.dart';
 
-int resolveMaxPowerThreads(AppSettings settings) {
-  var max = settings.extraThreads ? 162 : 90;
-  if (settings.hashes == 'Ручной') {
-    final hashCount = settings.customHashes
-        .split(',')
-        .where((value) => value.trim().isNotEmpty)
-        .length;
-    final cappedByHashes = hashCount * 27;
-    if (hashCount > 0 && cappedByHashes < max) {
-      max = cappedByHashes;
+const List<int> kWorkerSteps = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+
+int closestWorkerStep(int requested) {
+  if (requested <= 5) return 5;
+  int closest = kWorkerSteps.first;
+  int minDiff = (requested - closest).abs();
+  for (final step in kWorkerSteps) {
+    final diff = (requested - step).abs();
+    if (diff < minDiff) {
+      minDiff = diff;
+      closest = step;
     }
   }
-  return max < 9 ? 9 : max;
+  return closest;
+}
+
+int workerStepIndex(int workers) {
+  final step = closestWorkerStep(workers);
+  final idx = kWorkerSteps.indexOf(step);
+  return idx >= 0 ? idx : 1;
+}
+
+int resolveMaxPowerThreads(AppSettings settings) {
+  return 100;
 }
 
 class CustomTextField extends StatelessWidget {

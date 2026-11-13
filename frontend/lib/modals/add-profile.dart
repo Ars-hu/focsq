@@ -48,8 +48,8 @@ class _AddProfileModalState extends State<AddProfileModal> {
   final _ipCtrl = TextEditingController();
   final _portCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
-  double _power = 9;
-  double _maxPower = 90;
+  double _power = 10;
+  double _maxPower = 100;
 
   String? _ipError;
   String? _portError;
@@ -212,11 +212,12 @@ class _AddProfileModalState extends State<AddProfileModal> {
                       ),
                     ),
                     child: Slider(
-                      value: _power,
-                      min: 9,
-                      max: _maxPower,
-                      divisions: ((_maxPower - 9) / 9).round(),
-                      onChanged: (v) => setState(() => _power = v),
+                      value: workerStepIndex(_power.toInt()).toDouble(),
+                      min: 0,
+                      max: (kWorkerSteps.length - 1).toDouble(),
+                      divisions: kWorkerSteps.length - 1,
+                      onChanged: (v) =>
+                          setState(() => _power = kWorkerSteps[v.round()].toDouble()),
                     ),
                   ),
                   const SizedBox(height: 16),

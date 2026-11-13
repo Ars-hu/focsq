@@ -18,6 +18,7 @@ import 'logs.dart';
 import 'tun_rights.dart';
 import 'vk/auto_calls.dart';
 import 'vk/token.dart';
+import '../modals/profile_form_components.dart';
 
 enum ConnectState { disconnected, connecting, connected, disconnecting }
 
@@ -519,7 +520,7 @@ class ConnectService extends ChangeNotifier {
     }
   }
 
-  int _normalizeWorkers(int? requested) => requested ?? 9;
+  int _normalizeWorkers(int? requested) => closestWorkerStep(requested ?? 10);
 
   int _lastGeneration = 0;
 
